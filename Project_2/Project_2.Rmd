@@ -1,0 +1,394 @@
+---
+title: 'DATA643 - Project 2: Evaluating Recommender Systems'
+author: "Erik Nylander"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+```{R, include = FALSE}
+library(tidyr)
+library(ggplot2)
+library(recommenderlab)
+```
+## 1 - Description
+***
+[MovieLens](https://grouplens.org/datasets/movielens/) is a data set that contains ratings from the MovieLense website (http://movielens.org). This data set is broken into a number of different sizes for research purposes. We will be using the small data set containing 100,000 ratings applied to 9,000 movies by 700 users. The data set has already been filtered to include only users that have at least 10 reviews, we will reduce the data set even further to only look at the movies that have been reviewed at least 20 times. This should help us to zero in on the relevant information. We can come back later and adjust this parameter to tweak the recommender.
+
+Using the MovieLense data set we will construct a user-based collaborative filter and an item-based collaborative filter recommender systems. We will then tweak the different parameters and see how this effects the accuracy of the recommendations. We will be using the *recommenderlab* package to assist the building of these systems. 
+
+## 2 - DataSet
+***
+The MovieLense data is broken into two data sets that we are interested in using. The first is the movies data that contains the movie ID, the title, and genres. The second is the user ratings data that contains the user ID, the movie ID, and the rating, and a time-stamp in UNIX time. We will drop the time-stamp data for this project.
+
+#### 2.1 - Reading in the Data
+Reading in the required data set.
+
+```{R, include = TRUE}
+movies <- read.csv("~/GitHub/DATA643/data/ml-latest-small/movies.csv", header = TRUE, sep = ",",
+                   stringsAsFactors = FALSE, encoding = "UTF-8")
+ratings <- read.csv("~/GitHub/DATA643/data/ml-latest-small/ratings.csv", header = TRUE, sep =",",
+                    stringsAsFactors = FALSE)
+ratings <- ratings[,c(1,2,3)]
+```
+
+#### 2.2 - Creating the User-Item Matrix
+Now that we have our data set we will construct the user item matrix. The rows of the matrix represent the users and the columns of the matrix represent the movies. Converting the matrix to a real Rating Matrix reduces the size from almost 50MB to 1.7MB!
+```{R}
+# Creating a sparse matrix of users as rows and movieId as columns.
+user_movie <- ratings %>%
+  spread(key = movieId, value = rating) %>%
+  as.matrix()
+
+user_movie = user_movie[,-1] #remove userID col. Rows are userIds, cols are movieIds
+
+user_movie <- as(user_movie, "realRatingMatrix")
+```
+
+#### 2.3 - Reducing the Number of Movies
+We know from the description of dataset that there are movies that have not been viewed as many times as others. We looking at the number of movies that have been reviewed at least 10 times we see that there are only 2083 movies that match this criteria. Reducing our data set to just these movies still gives us 80,295 ratings to work with.
+
+```{R}
+dim(user_movie[,colCounts(user_movie) > 10])
+
+user_movie <- user_movie[,colCounts(user_movie) > 10]
+user_movie
+```
+
+#### 2.4 - Creating Training and Test Data Sets
+Given that we would like to compare a number of different models we need to create training and test sets that can be used for these comparisons. The training set will contain 80% of the data and the set set will contain the other 20%. We will use the built in *recomenderlab* function *evaluationScheme* to split the data. This will also allow us to us the build in evaluation functions to measure our performance.
+
+```{R}
+set.seed(42) # What other seed is there!
+
+movie <- evaluationScheme(user_movie, method = "split", train = .8, given = 5, goodRating = 3)
+movie
+```
+
+## 3 - Building and Evaluating the Models
+***
+For this section we will building and evaluating a number of different user-user and item-item collaborative filter models by varying the different parameters. We will also leverage some of built in features of *recommenderlab* to evaluate our various models at different recommendation levels. We will measure the RMSE, and look at the ROC plot and the precision-recall plots for various numbers of recommendations.
+
+### 3.1 - User-Based Colaborative Filtering
+We start by looking at the performance of the user-user CF recommender. We will be adjusting a number of the different available parameters to attempt the find the best performing model. Lets start with the neighborhood size.
+
+#### 3.1.1 - Neighborhood Size 
+We will start by looking at 6 different neighborhood sizes for the user-based CF.
+```{R}
+#Leveraging recommenderlabs ability to run multiple models at once for evaluation.
+user_nn <- list(
+  "10 NN" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=10)),
+  "20 NN" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=20)),
+  "30 NN" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=30)),
+  "40 NN" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=40)),
+  "50 NN" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=50)),
+  "60 NN" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=60))
+)
+
+# Run the algorithm and predice th next n movies for comparison purposes
+recs <- c(1,5, 10, 15, 20, 25)
+user_nn_results <- evaluate(movie, user_nn, n = recs, progress = FALSE)
+```
+
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = user_nn_results, y = "ROC", annotate = 4, legend="topleft")
+```
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+plot(x = user_nn_results, y = "prec/rec", annotate = 5)
+```
+
+**Calculating the RMSE** 
+
+From the above graphs we see that there is effectively little difference between 40,50, and 60 nearest neighbors in the ROC and precision vs recall curves for all numbers of recommendations. Therefore we can pick any of these three values for the number of nearest neighbors to get similar results. Lets choose 50 for our best candidate and use this value to check other parameters. We see that using these parameters gives us a RMSE of 1.00462. 
+
+```{R}
+model <- Recommender(getData(movie, "train"), method = "UBCF", 
+                     param=list(normalize = "Z-Score", method="Cosine", nn=50))
+
+prediction <- predict(model, getData(movie, "known"), type="ratings")
+
+rmse_ubcf <- calcPredictionAccuracy(prediction, getData(movie, "unknown"))[1]
+rmse_ubcf
+```
+
+#### 3.1.2 - Normalization Method
+Our next parameter of interest is the method of normalization. Currently *recommenderlab* supports center and z-score. Lest see which of the two gives us the best results.
+
+```{R}
+user_norm <- list(
+  "Center" = list(name="UBCF", param=list(normalize = "center",
+                                         method="Cosine",
+                                         nn=50)),
+  "Z-score" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=50))
+)
+
+user_norm_results <- evaluate(movie, user_norm, n = recs, progress = FALSE)
+```
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = user_norm_results, y = "ROC", annotate = 1, legend="topleft")
+```
+
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+plot(x = user_norm_results, y = "prec/rec", annotate = 1)
+```
+
+**Calculating the RMSE**  
+We can see that the above graphs indicate that the Z-Score centering does a slightly better job at many of the recommendation levels. This is the same normalization technique that we used to calculate the RMSE above so we will continue using this as our best user based collaborative filtering model.
+
+#### 3.1.3 Distance Methods
+The final parameter that we will be tweaking is the measurement of the distance or similarity of a user and their nearest neighbors. To do this we will look at three different measurements of the similarity; specifically the Pearson's, Cosine, and Jaccard distances. Using the results from the previous analysis we will use the 50 nearest neighbors and the Z-score normalization as we analyze the distance parameter.
+
+```{R}
+user_dist <- list(
+  "Pearsons" = list(name="UBCF", param=list(normalize = "z-score",
+                                         method="pearson",
+                                         nn=50)),
+  "Cosine" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         nn=50)),
+  "Jaccard" = list(name="UBCF", param=list(normalize = "Z-score",
+                                         method="jaccard",
+                                         nn=50))
+)
+
+user_dist_results <- evaluate(movie, user_dist, n = recs, progress = FALSE)
+```
+
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = user_dist_results, y = "ROC", annotate = 3, legend="topleft")
+```
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+plot(x = user_dist_results, y = "prec/rec", annotate = c(1,3))
+```
+
+**Calculating the RMSE** 
+We can see from the above graphs that the Jaccard distance seems to slightly outperform the other distance methods although we do note that the Pearson's distance has very strong performance for smaller numbers of recommendations. We will go ahead and calculate the RMSE for both to determine which is the best.  
+
+**Jaccard Distance RMSE**
+```{R}
+model <- Recommender(getData(movie, "train"), method = "UBCF", 
+                     param=list(normalize = "Z-Score", method="jaccard", nn=50))
+
+prediction <- predict(model, getData(movie, "known"), type="ratings")
+
+rmse_dist <- calcPredictionAccuracy(prediction, getData(movie, "unknown"))[1]
+rmse_dist
+```
+
+**Pearson's Distance RMSE**
+```{R}
+model <- Recommender(getData(movie, "train"), method = "UBCF", 
+                     param=list(normalize = "Z-Score", method="pearson", nn=50))
+
+prediction <- predict(model, getData(movie, "known"), type="ratings")
+
+rmse_dist <- calcPredictionAccuracy(prediction, getData(movie, "unknown"))[1]
+rmse_dist
+```
+
+Interestingly we see that the best performance of the model comes from the Pearson's Method of calculating the distance in the user based collaborative filtering model. Our best user based collaborative filtering model ends up incorporating the following parameters:  
+
+  * Uses the 50 nearest neighbors
+  * Normalizes the data using the Z-Score
+  * Calculates the similarity using Pearson's Similarity
+  
+
+#### 3.2 Item Based Collaborative Filtering  
+Having developed a best performing model using user based collaborative filtering we will now work on developing an item based collaborative filter. We will follow the same methodology as a above to find our best item based model and compare these two models to each other.  
+
+#### 3.2.1 - Neighborhood Size 
+We will start by looking at 7 different neighborhood sizes for the item-based CF.
+```{R}
+#Leveraging recommenderlabs ability to run multiple models at once for evaluation.
+item_nn <- list(
+  "10 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=10)),
+  "15 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=15)),
+  "20 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=20)),
+  "25 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=25)),
+  "30 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=30)),
+  "35 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=35)),
+  "40 K" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=40))
+)
+
+# Run the algorithm and predice the next n movies for comparison purposes
+item_nn_results <- evaluate(movie, item_nn, n = recs, progress = FALSE)
+```
+
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = item_nn_results, y = "ROC", annotate = 1, legend="topleft")
+```
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+plot(x = item_nn_results, y = "prec/rec", annotate = 1)
+```
+
+**Calculating the RMSE** 
+
+From the above graphs we see that the best performance comes from including 10 items in the neighborhood in the ROC and precision vs recall curves for all numbers of recommendations. We see that using these parameters gives us a RMSE of 1.175974.
+
+```{R}
+item_model <- Recommender(getData(movie, "train"), method = "IBCF", 
+                     param=list(normalize = "Z-Score", method="Cosine", k=10))
+
+item_prediction <- predict(item_model, getData(movie, "known"), type="ratings")
+
+rmse_ibcf <- calcPredictionAccuracy(item_prediction, getData(movie, "unknown"))[1]
+rmse_ibcf
+```
+
+#### 3.2.2 Normalization Methods
+Our next parameter of interest is the method of normalization. Currently *recommenderlab* supports center and z-score. Lest see which of the two gives us the best results.
+
+```{R}
+item_norm <- list(
+  "Center" = list(name="IBCF", param=list(normalize = "center",
+                                         method="Cosine",
+                                         k=10)),
+  "Z-score" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=10))
+)
+
+item_norm_results <- evaluate(movie, item_norm, n = recs, progress = FALSE)
+```
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = item_norm_results, y = "ROC", annotate = 1, legend="topleft")
+```
+
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+plot(x = item_norm_results, y = "prec/rec", annotate = 1)
+```
+
+**Calculating the RMSE**  
+We can see that the above graphs indicate that the Z-Score centering does a slightly better job at many of the recommendation levels. This is the same normalization technique that we used to calculate the RMSE above so we will continue using this as our best user based collaborative filtering model.
+
+
+#### 3.2.3 Distance Methods
+The final parameter that we will be tweaking is the measurement of the distance or similarity of an item and their nearest neighbors. To do this we will look at three different measurements of the similarity; specifically the Pearson's, Cosine, and Jaccard distances. Using the results from the previous analysis we will use the 10 nearest items and the Z-score normalization as we analyze the distance parameter.
+
+```{R}
+item_dist <- list(
+  "Pearsons" = list(name="IBCF", param=list(normalize = "z-score",
+                                         method="pearson",
+                                         k=10)),
+  "Cosine" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="Cosine",
+                                         k=10)),
+  "Jaccard" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="jaccard",
+                                         k=10))
+)
+
+item_dist_results <- evaluate(movie, item_dist, n = recs, progress = FALSE)
+```
+
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = item_dist_results, y = "ROC", annotate = 3, legend="topleft")
+```
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+ plot(x = item_dist_results, y = "prec/rec", annotate = c(1,3))
+```
+
+**Calculating the RMSE** 
+We can see from the above graphs that the Jaccard distance seems to outperform the other distance methods although we do note that the Pearson's distance has some very odd performance. We will go ahead and calculate the RMSE for both to determine which is the best.  
+
+```{R}
+model <- Recommender(getData(movie, "train"), method = "IBCF", 
+                     param=list(normalize = "Z-Score", method="jaccard", k=10))
+
+prediction <- predict(model, getData(movie, "known"), type="ratings")
+
+rmse_item <- calcPredictionAccuracy(prediction, getData(movie, "unknown"))[1]
+rmse_item
+```
+
+We see that the best performance of the model comes from the Jaccard Method of calculating the distance in the item based collaborative filtering model. Our best user based collaborative filtering model ends up incorporating the following parameters:  
+
+  * 10 Nearest Items
+  * Normalized using the Z-Score
+  * Similarity Calculated using Jaccard Method
+
+
+## 4 - Conclustions
+In this project we have attempted to build the best possible user-based and item-based collaborative filtering model by tweaking the parameters available to in the *recomenderlab* package. Now that we have these two models lets compare them to each other. Form our comparison below of the two models we see that, with our best parameter set, The UBCF model performs better on our test data set then the IBCF. The UBCF show better results in both the ROC curve and the precision recall curves. When we look at the RMSE, a measure of the accuracy of our predictions, we see that the UBCF has a RMSE of 0.9414067 while the IBCF has a RMSE of 1.077888. Finally we do get some interesting results when we look at times to compile and predict in the model. The UBCF took almost no time to compile and about .64 seconds to do it's predictions while the IBCF took 37.12 seconds to compile the model but predicted the results in 0.05 seconds. If this trend continues over multiple runs of the two models then it may come down to how often you need to build a new model vs the number of times you need to provide recommendations with these two models. It appears that the UBCF give us the best accuracy at the cost of slower recommendations while the IBCF gives us slightly worse but faster performance. 
+
+```{R}
+final_models <- list(
+  "UBCF" = list(name="UBCF", param=list(normalize = "z-score",
+                                         method="pearson",
+                                         nn=50)),
+  "IBCF" = list(name="IBCF", param=list(normalize = "Z-score",
+                                         method="jaccard",
+                                         k=10))
+)
+
+final_results <- evaluate(movie, final_models, n = recs, progress = FALSE)
+```
+
+**Drawing the ROC Curve**
+```{R}
+# Draw the ROC curve
+plot(x = final_results, y = "ROC", annotate = c(1,2), legend="topleft")
+```
+
+**Dawing the Precision / Recall Curve**
+```{R}
+# Draw the precision / recall curve
+ plot(x = final_results, y = "prec/rec", annotate = c(1,3))
+```
