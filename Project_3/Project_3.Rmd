@@ -1,0 +1,203 @@
+---
+title: 'DATA643 - Project 3: Recommender System using Singular Value Decomposition'
+author: "Erik Nylander"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+---
+
+```{R, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(recommenderlab)
+library(irlba)
+library(reshape2)
+```
+
+## 1 - Description
+***
+In this project we will be building a recommender system using Singular Value Decomposition for beers. We will be using the data set from [Beer Advocate](https://www.beeradvocate.com/) which can be found on [Data Wrold](https://data.world/socialmediadata/beeradvocate) with a login required. We will also use linear regression to see if a set of summary statistics that we generate can be used to improve the SVD recommendation
+
+## 2 - DataSet
+***
+We will start by loading in the data an taking a look at what is provided by Beer Advocate. We can see that along with information about the review and the beer, there is also information about the brewery and when the beer was reviewed. For this project we will drop these columns. The beer advocate data also contains 1.58 million reviews of various beers. For this project we want to reduce this number by limiting our system to only active reviewers and beers. To do this, We will remove all beers that have been reviewed less than 100 times and all reviewers that have reviewed less than 50 beers. This reduces our number of reviews to just under a million and should help to reduce the effects of reviewers and beers that are not active on the process of building a recommender system. 
+```{R, include = TRUE}
+ratings <- read.csv("~/GitHub/DATA643/data/beeradvocate/beer_reviews.csv", header = TRUE, sep =",",
+                    stringsAsFactors = FALSE)
+
+head(ratings)
+```
+
+```{R}
+beer <- ratings %>%
+  group_by(beer_beerid) %>%
+  filter(n()>100) %>%
+  group_by(review_profilename) %>%
+  filter(n()>50) %>%
+  select(-brewery_id, -brewery_name, -review_time)
+```
+
+## 3 Pre-Processing the Data
+***
+Now that we have our data set we want to do some pre-processing and summarizing work that will later be used to build out the SVD beer recommender. We start with creating the user-item matrix and then move on to constructing the summary statistics that we will use later.
+
+#### 3.1 - Building the User-Item Matrix
+Given the type of data that we have here, there is the potential for repeated rows where a reviewer has reviewed a beer more than once. In fact, when we first attempted to used the spread() function of the *tidyr* package we got a duplicate identifiers error indicating that this was the case. Therefore we will use the dcast() function from *reshape2* which includes the ability to aggregate the data when reshaping it to a user-item matrix as recommended in Professor Stern's video. We can examine the top left corner and see that we have our expected user item matrix with some reviews visible.
+
+```{R}
+# Generating the user-item matrix
+user_beer <- dcast(beer, review_profilename~beer_name, 
+                   value.var = "review_overall", fill=0, fun.aggregate = mean)
+
+# Filling in rownames
+rownames(user_beer) = user_beer$review_profilename
+
+# Removing the first column
+user_beer <- user_beer[,-1]
+
+# Converting to a matrix
+user_beer <- as.matrix(user_beer)
+
+# Looking at the upper left corner
+user_beer[1:6, 1:6]
+```
+
+#### 3.2 - Generating the Summary Statiistics
+We have decided to summarize some of the data columns that we have from the original data set to see if they may be of use in determining the final recommendation. We will also use this information to try to tie in what we know about linear regression to determine which of these measures are the most predictive for recommending to users. We will generate the following factors per user:  
+
+1. Average of the users reviews (avg_reviews)  
+2. Average of the users aroma reviews (avg_aroma)  
+3. Average of the users appearance reviews (avg_appearance)
+4. Average of the users palate reviews (avg_palate)
+5. Average of the users taste reviews (avg_taste)
+6. The number of beers that each user reviewed, this will be used to calculate a more accurate average predicted review later in the process (beers_reviewed)
+7. The bias in a users reviews from the average review (review_bias)
+8. The bias in a users aroma reviews from the average review (aroma_bias)
+9. The bias in a users appearance reviews and the average review (appearance_bias)
+10. The bias in a users palate reviews from the average review (palate_bias)
+11. The bias in a users taste reviews from the average review (taste_bias)
+
+We leverage some of the capabilities of the *dplyr* package to simplify this process. 
+
+```{R}
+beer_summary <- beer %>%
+  group_by(review_profilename) %>%
+  summarise(
+    avg_review = mean(review_overall),
+    avg_aroma = mean(review_aroma),
+    avg_apperance = mean(review_appearance),
+    avg_palate = mean(review_palate),
+    avg_taste = mean(review_taste),
+    beers_reviewed = n()
+  ) %>%
+  mutate(review_bias = avg_review - mean(avg_review),
+         aroma_bias = avg_aroma - mean(avg_aroma),
+         apperance_bias = avg_apperance - mean(avg_apperance),
+         palate_bias = avg_palate - mean(avg_palate),
+         taste_bias = avg_taste - mean(avg_taste)
+  )
+```
+
+## 4 - Calculating the Singular Value Decomposition
+There are multiple methods for doing singular value decomposition in R including the base svd() function. However this function tends to be inefficient and it is oft recommended that we use the *irlba* package. *irlba* is short for Implicitly Restarted Lanczos Bidiagonalization Algorithm which preforms a truncated singular value decomposition that is often more accurate then the original SVD algorithm. Therefore, we will use the *irlba* package to calculate the SVD for our user-item matrix.
+```{R}
+# Computing the SVD
+decomp = irlba(user_beer, nu = 3, nv = 3)
+
+# Generating the prediction matrix
+beerPredict = beer_summary$avg_review + (decomp$u * sqrt(decomp$d)) %*% (sqrt(decomp$d) * t(decomp$v))
+
+# Renaming the rows and columns for easier lookups
+colnames(beerPredict) <- colnames(user_beer)
+rownames(beerPredict) <- rownames(user_beer)
+```
+
+One common method for evaluating a recommender system is by calculating the Root Mean Squared Error. This function takes the square root of the average difference squared between the predicted value and actual value at each point. We use the following function to calculate this value. One word of caution is that we need to have our matrix of actual values with NA's in the missing spots, if we don't then we run into the issue of our means being overwhelmed by the zeros in the matrix. 
+```{R}
+RMSE <- function(predictionMatrix, actualMatrix){
+  sqrt(mean((predictionMatrix - actualMatrix)^2, na.rm=T))
+}
+
+user_beerNA <- user_beer
+is.na(user_beerNA) <- user_beerNA == 0
+RMSE(beerPredict, user_beerNA)
+```
+
+We actually find from looking at the RMSE score that the SVD model has done a solid job of by being, on average, 1.4 stars away from the actual rating.
+
+## 5 - Building the Recommender
+***
+In this step we will do two things, we first build a function to handle doing basic recommendations based on the one shared by Professor Stern. We then attempt to fit a linear regression to the variables that we calculated above to see if we can get a better recommender based on our other statistics.
+
+#### 5.1 Using the SVD to build a Recommender
+Now that we have our matrix of predicted reviews the recommender will do one of the following. If the user has reviewed the beer before it will give them back their previous review. If they have not reviewed the beer before then it returns the predicted value generated from the SVD matrix.
+```{R}
+getBeer <- function(user, beer){
+  if(user_beer[user,beer] != 0){
+    paste("Previously Rated:", user_beer[user,beer])
+  }
+  else{
+    paste("Predicted Rating:", round(beerPredict[user,beer],1))
+  }
+}
+```
+
+Now that we have our recommender we will put it through it's paces to see if it is generating predictions that make sense. We see that the recommender is working as expected when we present a user with a beer that they have not rated we get a value that seems to be in a reasonable range, we also see that when we present a user with a beer that has already been rated we are returned with the users previous rating.
+```{R}
+getBeer("BeerLover99", "Alaskan Smoked Porter")
+```
+
+```{R}
+getBeer("2xHops", "#9")
+```
+
+#### 5.2 Can we improve the ratings with our Summay Information
+In this last section we will see if we can update our model by weighting the summary statistic for each user. We have decided to try and use the summary variables to predict the users actual average number of beers weighted. We see that on average our recommender seems to be over rating the beers. We first create and average predicted review column in our data. We also take a look at the the average of the reviewed values and note that the predicted values are slightly higher on average then the actual values.
+```{R}
+beer_summary$predicted <- apply(beerPredict, 1, mean, na.rm = T)
+paste("Actual Average:", mean(beer_summary$avg_review), " Predicted Average:", mean(beer_summary$predicted))
+```
+
+We next fit a linear model to the data to see which of our summary statistics have a significant impact on the predicted value.
+```{R}
+fit <- lm(beer_summary$avg_review ~ . -review_profilename, data=beer_summary)
+summary(fit)
+```
+
+It appears that we should add in the reviewers bias into the estimates to get a better predictor of the actual review. While other factors have a significant impact on the regression we see from their estimated coefficients that the impact is very minimal. Lets see what happens when we add that to our predictor.
+
+```{R}
+fit <- lm(beer_summary$avg_review ~ beer_summary$predicted + 
+            beer_summary$review_bias, data=beer_summary)
+summary(fit)
+```
+
+It appears that we should add in the reviewers bias into the estimates to get a better predictor of the actual review. Lets see what happens when we add that to our predictor.
+```{R}
+getBeerRating <- function(user, beer){
+  if(user_beer[user,beer] != 0){
+    paste("Previously Rated:", user_beer[user,beer])
+  }
+  else{
+    predicted = round(beerPredict[user,beer] + 
+                        beer_summary$review_bias[beer_summary$review_profilename == user], 1)
+    paste("Predicted Rating:", predicted)
+  }
+}
+```
+
+Looking at the same user beer combination as before, we see that the predicted rating is lowered slightly from the base prediction.
+```{R}
+getBeerRating("BeerLover99", "Alaskan Smoked Porter")
+```
+
+Finally lets take a look at what happens to the RMSE when we take all of the predicted values and add the user bias to the predicted values. Interestingly enough we see that the RMSE is actually increased adding in the user bias to the predictions.
+```{R}
+beerPredict2 <- sweep(beerPredict, 1, beer_summary$review_bias, "+")
+RMSE(beerPredict2, user_beerNA)
+```
+
+## 6 - Conclusion
+This project really helped us to get a stronger grasp on the Singular Value Decomposition process. It was interesting to see how this process works when compared to constructing the collaborative filtering models using the *recommmenderlab* package. From what we have done here it will be interesting to see the techniques for using information related to the ratings to help improve the predictive power of our recommender systems. we were a bit surprised to see that the information gathered from the linear regression process actually made the recommendation a bit worse. We would also liked to have been able to explore the SVD potion of the *recomenderlab* package but unfortunately ran out of time to explore this. 
