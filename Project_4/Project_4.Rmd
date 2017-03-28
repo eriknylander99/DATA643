@@ -1,0 +1,208 @@
+---
+title: 'DATA643 - Project 4: Implementing a Recommender System in Spark'
+author: "Erik Nylander"
+output:
+  html_notebook: default
+---
+
+## 1 - Description
+***
+In this project we will be re-implementing the recommender system built in project three using Spark and the *sparklyr* package. This recommender system uses Singular Value Decomposition to recommend beers to users. We will be using the data set from [Beer Advocate](https://www.beeradvocate.com/) which can be found on [Data Wrold](https://data.world/socialmediadata/beeradvocate) with a login required. After numerous attempts we were unable to implement a SVD based recommender, we chose to use the Alternating Least Squares model that was implemented in *sparklyr*. We have included the setup work for Spark and the steps needed to prepare the data for use in a Spark based system. 
+
+
+## 2 - Installing sparklyr and Spark and Loading the Data
+***
+In this section we include the code to install the latest version of *saprklyr*, install the version of Spark that we want to work with along with Hadoop. The ultimate goal is to be able to move this type of project to an Amazon Web Services platform based on Elastic MapReduce so we will go with the currently supported version of spark which is version 2.1.
+
+### 2.1 - Installation  
+We start by loading the most up-to-date version of *sparklyr* using the devtools package and installing our version of Spark. We also include the code we used to install the latest version of H2O through *rsparkling*. This path ultimately was a dead end as we were not able to implement the recommender using SVD and elected to move to implementing the recommender using ALS.
+```{R eval=FALSE}
+# Installing sparklyr
+devtools::install_github("rstudio/sparklyr")
+
+library(sparklyr)
+# Installing our version of spark
+spark_install(version = "2.1.0", hadoop_version = "2.7")
+
+# Used in an attempt to implement SVD
+install.packages("rsparkling")
+options(rsparkling.sparklingwater.version = "2.1.0")
+```
+
+### 2.2 - Connecting to Spark
+We now create a connection to our local spark cluster and load in our data. We will also use some of the built in *dplyr* functionality to subset our data to only include beers that have been reviewed more than 100 times and all reviewers that have reviewed more than 50 beers. This reduces our number of reviews to just under a million and should help to reduce the effects of reviewers and beers that are not active on the process of building a recommender system. We also found that we needed to reduce the data set for memory issues on the local version of Spark. We were able to crash the R session with the full data set.  
+
+```{R}
+library(sparklyr)
+library(dplyr)
+library(reshape2)
+
+# Generating the spark connection
+sc <- spark_connect(master = "local") 
+
+# Reading in the data
+ratings <- read.csv("~/GitHub/DATA643/data/beeradvocate/beer_reviews.csv", header = TRUE, sep =",",
+                    stringsAsFactors = FALSE)
+```
+
+### 2.3 - Loading Data
+We also learned from our first implementation that our best model seemed to come from simply applying SVD to the data and then adding the user's average rating. We found that the model preformed slightly worse when we added in measures such as user bias and item bias. For our Alternating Least Squares model we will also only pass the overall reviews to Spark. One of the issues that we ran into was that spark needs the reviewer's and beer's to be represented by numeric values. Much of the code below is focused on reducing the data set and preparing it for use in Spark. We also create a user-item matrix in this step. Originally this was used to attempt to use the SVD function in H2O. Unfortunately the matrix was to large to pass to a local copy of Spark and we also ran into issues with getting the data into a format that H2O would recognize. We were able o use this object later in the recommender.
+```{R}
+# Subsetting the ratings
+ratings <- ratings %>%
+  group_by(beer_beerid) %>%
+  filter(n()>100) %>%
+  group_by(review_profilename) %>%
+  filter(n()>50) %>%
+  select(-brewery_id, -brewery_name, -review_time)
+
+# Generating the user-item matrix for the predictor
+user_beer <- dcast(ratings, review_profilename~beer_name, 
+                   value.var = "review_overall", fill=0, fun.aggregate = mean)
+
+# Filling in rownames
+rownames(user_beer) = user_beer$review_profilename
+
+# Removing the first column
+user_beer <- user_beer[,-1]
+
+# Converting to a matrix
+user_beer <- as.matrix(user_beer)
+
+# Adding unique user id's using the numeric value of the factor value of the profile name
+ratings <- transform(ratings,user_id=as.numeric(factor(review_profilename)))
+
+# Creating a dataframe for user names and user id's
+u_names <- ratings %>%
+  distinct(review_profilename, user_id) %>%
+  arrange(user_id)
+
+# creating a dataframe for beer names and beer id's
+beer_names <- ratings %>%
+  distinct(beer_name, beer_beerid) %>%
+  arrange(beer_beerid)
+
+# creating a data frame of user id's, beer id's, and overall reviews.
+ratings <- ratings %>%
+  select(user_id, beer_beerid, review_overall)
+
+# Loading the data into Spark
+beer_tbl <- sdf_copy_to(sc, ratings, overwrite = TRUE)
+beer_tbl
+```
+
+## 3 - Building a Recommender using Alternating Least Squares on Spark
+***
+The recommender that we ended up building for this project was based on what we could get to work. We tried to recreate the SVD system from Project 3 but ran into issues getting a form of SVD to work in the Spark system. After many days of debugging the system we ended up moving forward with the ALS method that is supported in the *sparklyr* package. 
+
+#### 3.1 Creating the Model
+We start by building the model using the *ml_als_factorization()* and using the technique shared by Professor Stern to create a dataframe from the model and calculate the RMSE. One issue that we ran into here was that given the size of our data we were only able to use 5 iterations of the algorithm before the R session ran into memory issues. This is one area that would be improved by moving the code to a web based system.
+
+```{R}
+model <- ml_als_factorization(beer_tbl, rating.column = "review_overall", 
+                              user.column = "user_id",
+                              item.column = "beer_beerid",
+                              iter.max = 5, regularization.parameter = 0.01, 
+                              implicit.preferences = TRUE, alpha = 1.0)
+```
+
+We take a quick look at the available information from the model.
+```{R}
+summary(model)
+```
+
+Generating a dataframe of the predicted values for the beers that each of the reviewers have actually reviewed. We will use this information to further measure the performance of the model.
+```{R}
+predictions <- model$.model %>%
+  invoke("transform", spark_dataframe(beer_tbl)) %>%
+  collect()
+
+predictions[predictions$user_id == 1,]
+```
+
+#### 3.2 Calculating the RMSE
+We note that the RMSE is very good for this application we have calculated and error of 0.51. On average our recommendations are within half of a point from the actual predictions. 
+```{R}
+sqrt(mean(with(predictions, prediction-review_overall)^2))
+```
+
+#### 3.3 Generating the Prediction Matrix  
+One of the aspects of the model generated by the *ml_als_factorization()* function is the matrix of user factors and the matrix of item factors that can b recomposed into a matrix of predictions by multiplying the User matrix by the Item matrix transposed. We do this and add back in the user and beer names to facilitate look-up for the recommender.
+```{R}
+# Extracting the User and Item factor matrices
+user_matrix <- as.matrix(model$user.factors[,-1])
+item_matrix <- as.matrix(model$item.factors[,-1])
+
+# Calculating the predicted ratings matrix
+ratings_pred <- user_matrix %*% t(item_matrix)
+
+# Adding in the user(row) and beer(column) names 
+rownames(ratings_pred) = u_names$review_profilename
+colnames(ratings_pred) = beer_names$beer_name
+
+# Looking at the upper left corner
+ratings_pred[1:6, 1:6]
+```
+
+Now that we have our information we can shut down the spark connection.
+```{R}
+spark_disconnect(sc)
+```
+
+## 4 - Building the Recommender
+***
+We will build the recommender in a similar way to the method that we used in project 3. We use the previously rated value if the reviewer has already rated the beer and predicted rating if the user has not rated the beer yet.
+```{R}
+getBeer <- function(user, beer){
+  if(user_beer[user, beer] != 0){
+    paste("Previously Rated:", user_beer[user,beer])
+  }
+  else{
+    paste("Predicted Rating:", round(ratings_pred[user,beer],1))
+  }
+}
+```
+
+```{R}
+getBeer("BeerLover99", "Alaskan Smoked Porter")
+```
+
+```{R}
+getBeer("2xHops", "#9")
+```
+
+## 4 - Evaluating the Recommender
+***
+Now that we have the recommender built and a set of recommendations for our previously rated values we can start to evaluate the recommender. We will look at the root mean square error, create the confusion matrix, and calculate the precision, true-positive rate, and false-positive rate.
+
+#### 4.1 Evaluating the RMSE
+We start off by comparing the RMSE with the value we computed last week. Using Spark and the ALS algorithm we were able to achieve a RMSE = 0.51. When we used the SVD algorithm was a RMSE = 1.38. There is the possibility that the ALS method is overfiting the data and we will need more testing to determine this.
+
+#### 4.2 Creating a Confusion Matrix
+We next want to look at the total number of true positives and true negatives that we got from the reocmmender. We do this by counting any rating of a 3 or above as a positive and any review of a 3 or below as a negative. We see that the recommender seems to do a good job of predicting the true positives but we may have some issues with more poorly rates beers.
+```{R}
+confusion <- beer_pred %>% 
+  mutate(actual = if_else(review_overall >= 3, 1, 0),
+         predicted = if_else(prediction >= 3, 1, 0)) %>%
+  select(actual, predicted)
+
+cf_table <- table(confusion)
+cf_table
+```
+
+#### Calculating the Precision, Recall, and False Positive Rates
+We finish up our evaluation of the system by calculating the precision, recall, and false positive rate. For our recommender. We see that the recommender system has both a high precision and recall but it also has a high false negative rate. We wonder if this might not be related to a class imbalance problem or where we set up our cut score for positive and negative scores. 
+```{R}
+precision = (cf_table[2,2])/(cf_table[2,2] + cf_table[1,1])
+recall = (cf_table[2,2])/(cf_table[2,2] + cf_table[2,1])
+falseneg = (cf_table[1,2])/(cf_table[1,2] + cf_table[1,1])
+
+paste("Percision =", precision, " Recall =", recall, " False Negative =", falseneg)
+```
+
+## 5 - Conclusion
+The project provided a number of interesting challenges for us. The installation and setup of Spark proved to be more complicated then first expected. Once we were able to get a local instance of Spark running we then ran into some classic big data issues. The first attempt to load the user-item matrix into the spark cluster caused the R session to crash. We also ran into the same issue when we attempted to run to many iterations in the ALS model. This would be improved by moving to an AWS installation of Spark but it did limit our testing for this project. We also see from evaluation of the recommender system that we have an issue with any recommendations that are not true positives.  
+
+Finally we ran into a number of issues with attempting to perform SVD on the data. The H2O package include with *sparklyr* should have this functionality but we were unable to debug the issues with our system and get any type of result with this method. We were able to work around this issue but had to implement a different recommendation algorithm to get this to work.  
+
+This method of building the recommender had a number pros and cons compared to building the system in local memory. The ALS algorithm was able to run very quickly and the having the data offloaded to Spark seemed to provide a large boost in speed. We also were able, with a few lines of code, generate a very accurate recommender using a more advanced mathematical technique. The trade off was that we needed to spend a lot of time on the front end setting up the system and preparing the data to match a format that algorithm could work with. Ultimately I think that this method is a better and faster way to build the recommender once all a data preparation workflow has been figured out.
